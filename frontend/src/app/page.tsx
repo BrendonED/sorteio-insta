@@ -17,8 +17,12 @@ export default function Home() {
   const [winner, setWinner] = useState<Comment | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
 
-  // We will assume the backend runs on port 8000
-  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  // Garantir que a URL base não termine com barra e comece com http
+  let rawUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  if (!rawUrl.startsWith("http")) {
+    rawUrl = "https://" + rawUrl;
+  }
+  const BACKEND_URL = rawUrl.replace(/\/$/, "");
 
   const handleLoadComments = async () => {
     if (!url) {
