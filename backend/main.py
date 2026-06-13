@@ -35,7 +35,8 @@ if not IS_SIMULATION and INSTA_USERNAME and INSTA_PASSWORD:
         cl.login(INSTA_USERNAME, INSTA_PASSWORD)
         print("Login concluído com sucesso.")
     except Exception as e:
-        print(f"Erro ao logar no Instagram: {e}")
+        import traceback
+        print(f"Erro ao logar no Instagram:\n{traceback.format_exc()}")
 
 class ScrapeRequest(BaseModel):
     url: str
@@ -78,8 +79,11 @@ def get_media_comments_paginated(job_id: str, url: str):
         jobs[job_id]["status"] = "completed"
         
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"ERRO AO RASPAR COMENTÁRIOS: {error_details}")
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["error"] = f"Erro na extração: {str(e)}"
 
 
 @app.post("/api/scrape")
