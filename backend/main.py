@@ -1,7 +1,10 @@
 import asyncio
 import json
 import os
+import re
+import time
 import uuid
+import random
 import requests
 from typing import Dict, Any
 
@@ -22,83 +25,160 @@ app.add_middleware(
 
 jobs: Dict[str, Any] = {}
 
-# Chave da RapidAPI que o usuário precisa configurar no Render
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+# Lista de User-Agents para rotacionar e evitar bloqueios
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+]
 
-class ScrapeRequest(BaseModel):
-    url: str
+def shortcode_to_media_id(shortcode: str) -> int:
+    """
+    Converte o shortcode do Instagram (ex: DLUWkieNc0u) para o media_id numérico.
+    Usa o mesmo algoritmo do Instagram (base64url decoding).
+    """
+    ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    media_id = 0
+    for char in shortcode:
+        media_id = media_id * 64 + ALPHABET.index(char)
+    return media_id
+
+def extract_shortcode(url: str) -> str:
+    """
+    Extrai o shortcode da URL do post. Funciona com /p/, /reel/ e /tv/
+    Exemplos:
+    - https://www.instagram.com/p/DLUWkieNc0u/
+    - https://www.instagram.com/reel/DLUWkieNc0u/?igsh=...
+    """
+    match = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if not match:
+        raise ValueError(f"Não foi possível extrair o código do post da URL: {url}")
+    return match.group(1)
+
+def get_session_headers(session_cookies: dict = None) -> dict:
+    """Monta headers que imitam um navegador real."""
+    ua = random.choice(USER_AGENTS)
+    headers = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "X-IG-App-ID": "936619743392459",  # ID fixo do app web do Instagram
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/",
+        "Origin": "https://www.instagram.com",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    return headers
+
 
 def get_media_comments_paginated(job_id: str, url: str):
     try:
-        # Extrair o media_code da URL (ex: https://www.instagram.com/p/DLUWkieNc0u/ -> DLUWkieNc0u)
-        # Lógica simples de split
-        parts = [p for p in url.split("/") if p]
-        media_code = parts[-1]
-        if media_code == "comments":
-             media_code = parts[-2]
-             
         jobs[job_id]["status"] = "running"
-        jobs[job_id]["progress"] = "Conectando à RapidAPI..."
+        jobs[job_id]["progress"] = "Extraindo shortcode do link..."
+
+        shortcode = extract_shortcode(url)
+        media_id = shortcode_to_media_id(shortcode)
+
+        print(f"[JOB {job_id}] Shortcode: {shortcode} | Media ID: {media_id}")
+
+        jobs[job_id]["progress"] = f"Conectando ao Instagram (media_id: {media_id})..."
+
+        session = requests.Session()
         
-        if not RAPIDAPI_KEY:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = "RAPIDAPI_KEY não configurada no servidor (Render)."
-            return
+        # 1. Primeiro, faz uma requisição à página do post para obter cookies válidos (csrftoken)
+        page_url = f"https://www.instagram.com/p/{shortcode}/"
+        page_res = session.get(
+            page_url,
+            headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept-Language": "pt-BR,pt;q=0.9",
+            },
+            timeout=20,
+        )
+        print(f"[JOB {job_id}] Cookies da página: {dict(session.cookies)}")
 
         all_comments = []
-        end_cursor = ""
+        end_cursor = None
         has_next_page = True
-        
-        headers = {
-            "x-rapidapi-host": "instagram-scraper-stable-api.p.rapidapi.com",
-            "x-rapidapi-key": RAPIDAPI_KEY,
-            "Content-Type": "application/json"
-        }
-        
+        page_num = 0
+
         while has_next_page:
-            api_url = f"https://instagram-scraper-stable-api.p.rapidapi.com/get_post_comments.php?media_code={media_code}&sort_order=popular"
+            page_num += 1
+            params = {
+                "can_support_threading": "true",
+                "sort_order": "popular",
+            }
             if end_cursor:
-                api_url += f"&end_cursor={end_cursor}"
-                
-            response = requests.get(api_url, headers=headers)
-            
+                params["min_id"] = end_cursor
+
+            api_url = f"https://www.instagram.com/api/v1/media/{media_id}/comments/"
+
+            response = session.get(
+                api_url,
+                params=params,
+                headers=get_session_headers(),
+                timeout=20,
+            )
+
+            print(f"[JOB {job_id}] Página {page_num} | Status: {response.status_code}")
+
+            if response.status_code == 401:
+                # Instagram pedindo login — post privado ou conta bloqueada por IP
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"] = "Instagram exige login para acessar esse post (post privado ou bloqueio de IP do servidor). Tente um post público diferente ou use uma conta bot."
+                return
+
+            if response.status_code == 429:
+                # Rate limit — espera e tenta de novo
+                print(f"[JOB {job_id}] Rate limit! Aguardando 10s...")
+                time.sleep(10)
+                continue
+
             if response.status_code != 200:
-                raise Exception(f"Erro na RapidAPI: {response.status_code} - {response.text}")
-                
+                raise Exception(
+                    f"Instagram retornou status {response.status_code}: {response.text[:500]}"
+                )
+
             data = response.json()
-            
-            # Formato esperado da resposta da RapidAPI (baseado no comum desse endpoint)
-            # Pode variar, mas normalmente os comentários ficam em data.items ou data.comments
-            # Vamos assumir que venham numa lista 'items' ou 'data'
-            items = data.get("data", []) or data.get("items", [])
-            
-            for item in items:
-                # Ajuste de acordo com os campos reais da API (geralmente user.username e text)
-                username = item.get("user", {}).get("username", "desconhecido")
-                text = item.get("text", "")
-                all_comments.append({"user": username, "text": text})
-            
-            # Atualizar a tela do front
+
+            # Extrair comentários
+            comments_raw = data.get("comments", [])
+            for c in comments_raw:
+                user = c.get("user", {}).get("username", "desconhecido")
+                text = c.get("text", "")
+                all_comments.append({"user": user, "text": text})
+
+            # Atualizar progresso
             jobs[job_id]["progress"] = f"{len(all_comments)} comentários extraídos..."
-            
-            # Verificar paginação
-            page_info = data.get("page_info", {})
-            has_next_page = page_info.get("has_next_page", False)
-            end_cursor = page_info.get("end_cursor", "")
-            
-            # Esperar 2 segundos antes de pedir a próxima página para não tomar block de Rate Limit da RapidAPI
-            if has_next_page:
-                import time
-                time.sleep(2)
-        
+            print(f"[JOB {job_id}] Total até agora: {len(all_comments)}")
+
+            # Paginação — o Instagram usa "next_min_id" ou "has_more_comments"
+            has_next_page = data.get("has_more_comments", False)
+            end_cursor = data.get("next_min_id", None)
+
+            if has_next_page and end_cursor:
+                # Delay aleatório entre 1.5s e 3.5s para não tomar ban
+                delay = random.uniform(1.5, 3.5)
+                print(f"[JOB {job_id}] Próxima página em {delay:.1f}s...")
+                time.sleep(delay)
+            else:
+                break
+
         jobs[job_id]["comments"] = all_comments
         jobs[job_id]["progress"] = f"Extração de {len(all_comments)} comentários finalizada!"
         jobs[job_id]["status"] = "completed"
-        
+        print(f"[JOB {job_id}] Extração completa. {len(all_comments)} comentários.")
+
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"ERRO AO RASPAR COMENTÁRIOS: {error_details}")
+        print(f"ERRO AO RASPAR COMENTÁRIOS:\n{error_details}")
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = f"Erro na extração: {str(e)}"
 
@@ -108,13 +188,11 @@ async def start_scraping(req: ScrapeRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "starting",
-        "progress": "0/0",
+        "progress": "Iniciando...",
         "comments": [],
-        "error": None
+        "error": None,
     }
-    
     background_tasks.add_task(get_media_comments_paginated, job_id, req.url)
-    
     return {"job_id": job_id}
 
 
@@ -127,25 +205,26 @@ async def stream_progress(job_id: str, request: Request):
         while True:
             if await request.is_disconnected():
                 break
-                
+
             job = jobs[job_id]
-            # Convert job dict to JSON string safely
-            # We omit full comments array to save bandwidth during streaming if it's large, 
-            # except when completed. Actually, let's just send everything for simplicity, 
-            # but ideally frontend fetches comments via another endpoint if it's too big.
             data_to_send = {
                 "status": job["status"],
                 "progress": job["progress"],
-                "error": job["error"]
+                "error": job["error"],
             }
             if job["status"] == "completed":
                 data_to_send["comments"] = job["comments"]
-                
-            yield f"data: {json.dumps(data_to_send)}\n\n"
-            
+
+            yield f"data: {json.dumps(data_to_send, ensure_ascii=False)}\n\n"
+
             if job["status"] in ["completed", "error"]:
                 break
-                
+
             await asyncio.sleep(1)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Sorteio Insta API rodando!"}
