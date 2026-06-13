@@ -9,9 +9,10 @@ import requests
 from typing import Dict, Any
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 
 app = FastAPI()
 
@@ -25,7 +26,8 @@ app.add_middleware(
 
 jobs: Dict[str, Any] = {}
 
-# Lista de User-Agents para rotacionar e evitar bloqueios
+class ScrapeRequest(BaseModel):
+    url: Optional[str] = None
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -185,6 +187,14 @@ def get_media_comments_paginated(job_id: str, url: str):
 
 @app.post("/api/scrape")
 async def start_scraping(req: ScrapeRequest, background_tasks: BackgroundTasks):
+    print(f"[SCRAPE] Body recebido: url={req.url!r}")
+    
+    if not req.url or not req.url.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Campo 'url' é obrigatório e não pode ser vazio."}
+        )
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "starting",
@@ -192,7 +202,7 @@ async def start_scraping(req: ScrapeRequest, background_tasks: BackgroundTasks):
         "comments": [],
         "error": None,
     }
-    background_tasks.add_task(get_media_comments_paginated, job_id, req.url)
+    background_tasks.add_task(get_media_comments_paginated, job_id, req.url.strip())
     return {"job_id": job_id}
 
 
