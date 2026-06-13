@@ -1,15 +1,14 @@
 import asyncio
 import json
 import os
-import random
 import uuid
+import requests
 from typing import Dict, Any
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from instagrapi import Client
 
 app = FastAPI()
 
@@ -21,61 +20,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage for jobs
 jobs: Dict[str, Any] = {}
 
-cl = Client()
-INSTA_USERNAME = os.getenv("INSTA_USERNAME")
-INSTA_PASSWORD = os.getenv("INSTA_PASSWORD")
-IS_SIMULATION = os.getenv("IS_SIMULATION", "true").lower() == "true"
-
-if not IS_SIMULATION and INSTA_USERNAME and INSTA_PASSWORD:
-    try:
-        print(f"Iniciando login no Instagram para a conta: {INSTA_USERNAME}")
-        cl.login(INSTA_USERNAME, INSTA_PASSWORD)
-        print("Login concluído com sucesso.")
-    except Exception as e:
-        import traceback
-        print(f"Erro ao logar no Instagram:\n{traceback.format_exc()}")
+# Chave da RapidAPI que o usuário precisa configurar no Render
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 
 class ScrapeRequest(BaseModel):
     url: str
 
 def get_media_comments_paginated(job_id: str, url: str):
     try:
-        if IS_SIMULATION:
-            # Simulação para demonstrar a barra de progresso sem depender de login
-            jobs[job_id]["status"] = "running"
-            total = 3000
-            for i in range(0, total, 50):
-                jobs[job_id]["progress"] = f"{i}/{total}"
-                # Simula tempo de extração
-                asyncio.run(asyncio.sleep(1.5))
-            
-            # Conclui com dados falsos
-            fake_comments = [{"user": f"usuario_{i}", "text": f"Comentário de teste {i}"} for i in range(total)]
-            jobs[job_id]["comments"] = fake_comments
-            jobs[job_id]["progress"] = f"{total}/{total}"
-            jobs[job_id]["status"] = "completed"
+        # Extrair o media_code da URL (ex: https://www.instagram.com/p/DLUWkieNc0u/ -> DLUWkieNc0u)
+        # Lógica simples de split
+        parts = [p for p in url.split("/") if p]
+        media_code = parts[-1]
+        if media_code == "comments":
+             media_code = parts[-2]
+             
+        jobs[job_id]["status"] = "running"
+        jobs[job_id]["progress"] = "Conectando à RapidAPI..."
+        
+        if not RAPIDAPI_KEY:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = "RAPIDAPI_KEY não configurada no servidor (Render)."
             return
 
-        # Lógica real com instagrapi
-        media_pk = cl.media_pk_from_url(url)
-        jobs[job_id]["status"] = "running"
+        all_comments = []
+        end_cursor = ""
+        has_next_page = True
         
-        # O instagrapi não oferece uma forma trivial de paginar comentários e devolver a cada chunk facilmente
-        # O método media_comments baixa todos de uma vez (limitado por amount). 
-        # Num cenário real complexo, usaríamos a private API cursors.
-        # Aqui, vamos chamar media_comments com um amount grande (ex: 3000).
-        # Nota: ISSO PODE DEMORAR dependendo do volume.
-        amount = 3000
-        jobs[job_id]["progress"] = "Extraindo (isso pode levar alguns minutos)..."
+        headers = {
+            "x-rapidapi-host": "instagram-scraper-stable-api.p.rapidapi.com",
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "Content-Type": "application/json"
+        }
         
-        comments_obj = cl.media_comments(media_pk, amount=amount)
-        comments = [{"user": c.user.username, "text": c.text} for c in comments_obj]
+        while has_next_page:
+            api_url = f"https://instagram-scraper-stable-api.p.rapidapi.com/get_post_comments.php?media_code={media_code}&sort_order=popular"
+            if end_cursor:
+                api_url += f"&end_cursor={end_cursor}"
+                
+            response = requests.get(api_url, headers=headers)
+            
+            if response.status_code != 200:
+                raise Exception(f"Erro na RapidAPI: {response.status_code} - {response.text}")
+                
+            data = response.json()
+            
+            # Formato esperado da resposta da RapidAPI (baseado no comum desse endpoint)
+            # Pode variar, mas normalmente os comentários ficam em data.items ou data.comments
+            # Vamos assumir que venham numa lista 'items' ou 'data'
+            items = data.get("data", []) or data.get("items", [])
+            
+            for item in items:
+                # Ajuste de acordo com os campos reais da API (geralmente user.username e text)
+                username = item.get("user", {}).get("username", "desconhecido")
+                text = item.get("text", "")
+                all_comments.append({"user": username, "text": text})
+            
+            # Atualizar a tela do front
+            jobs[job_id]["progress"] = f"{len(all_comments)} comentários extraídos..."
+            
+            # Verificar paginação
+            page_info = data.get("page_info", {})
+            has_next_page = page_info.get("has_next_page", False)
+            end_cursor = page_info.get("end_cursor", "")
+            
+            # Esperar 2 segundos antes de pedir a próxima página para não tomar block de Rate Limit da RapidAPI
+            if has_next_page:
+                import time
+                time.sleep(2)
         
-        jobs[job_id]["comments"] = comments
-        jobs[job_id]["progress"] = f"{len(comments)}/{len(comments)}"
+        jobs[job_id]["comments"] = all_comments
+        jobs[job_id]["progress"] = f"Extração de {len(all_comments)} comentários finalizada!"
         jobs[job_id]["status"] = "completed"
         
     except Exception as e:
