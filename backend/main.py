@@ -25,12 +25,17 @@ app.add_middleware(
 
 jobs: Dict[str, Any] = {}
 
+# ── Configuração ──────────────────────────────────────────────────────────────
+# Coloque o valor do cookie "sessionid" do Instagram nas variáveis de ambiente do Render
+INSTAGRAM_SESSION_ID = os.getenv("INSTAGRAM_SESSION_ID", "")
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
 ]
+
 
 class ScrapeRequest(BaseModel):
     url: Optional[str] = None
@@ -43,6 +48,25 @@ def extract_shortcode(url: str) -> str:
     return match.group(1)
 
 
+def build_session() -> requests.Session:
+    """
+    Cria uma session com cookies de autenticação do Instagram.
+    O 'sessionid' é obtido do navegador do usuário e configurado via env var no Render.
+    """
+    if not INSTAGRAM_SESSION_ID:
+        raise Exception(
+            "INSTAGRAM_SESSION_ID não configurado! "
+            "Vá no painel do Render → Environment Variables e adicione seu sessionid do Instagram. "
+            "Veja as instruções no README do projeto."
+        )
+
+    session = requests.Session()
+    session.cookies.set("sessionid", INSTAGRAM_SESSION_ID, domain=".instagram.com")
+    session.cookies.set("ig_did", str(uuid.uuid4()), domain=".instagram.com")
+
+    return session
+
+
 def get_media_comments_paginated(job_id: str, url: str):
     try:
         jobs[job_id]["status"] = "running"
@@ -51,31 +75,28 @@ def get_media_comments_paginated(job_id: str, url: str):
         shortcode = extract_shortcode(url)
         print(f"[JOB {job_id}] Shortcode: {shortcode}")
 
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-        })
+        # Criar sessão autenticada
+        session = build_session()
 
-        # ── PASSO 1: visitar instagram.com para obter cookies base ──────────────
-        jobs[job_id]["progress"] = "Obtendo cookies do Instagram..."
-        try:
-            session.get("https://www.instagram.com/", timeout=15)
-        except Exception:
-            pass  # cookies parciais ainda podem ser úteis
-
-        # ── PASSO 2: visitar a página do post para refinar cookies + csrftoken ──
-        post_url = f"https://www.instagram.com/p/{shortcode}/"
-        jobs[job_id]["progress"] = "Abrindo página do post..."
-        page_res = session.get(post_url, timeout=20)
-        print(f"[JOB {job_id}] Página do post: {page_res.status_code}")
-        print(f"[JOB {job_id}] Cookies: {dict(session.cookies)}")
+        # ── Passo 1: visitar a página do post para obter csrftoken e demais cookies ──
+        jobs[job_id]["progress"] = "Abrindo página do post no Instagram..."
+        ua = random.choice(USER_AGENTS)
+        page_res = session.get(
+            f"https://www.instagram.com/p/{shortcode}/",
+            headers={
+                "User-Agent": ua,
+                "Accept-Language": "pt-BR,pt;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=25,
+        )
+        print(f"[JOB {job_id}] Página do post: HTTP {page_res.status_code}")
 
         csrf = session.cookies.get("csrftoken", "")
+        print(f"[JOB {job_id}] csrftoken obtido: {csrf[:10]}...")
 
-        # ── PASSO 3: scraping via GraphQL ────────────────────────────────────────
-        # Hash do query de comentários do Instagram Web (estável há anos)
+        # ── Passo 2: buscar comentários via GraphQL ───────────────────────────────────
+        # Hash estável do query de comentários do Instagram Web
         COMMENTS_QUERY_HASH = "bc3296d1ce80a24b1b6e40b1e72903f5"
 
         all_comments = []
@@ -83,19 +104,9 @@ def get_media_comments_paginated(job_id: str, url: str):
         has_next = True
         page_num = 0
 
-        graphql_headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "*/*",
-            "Accept-Language": "pt-BR,pt;q=0.9",
-            "Referer": post_url,
-            "X-CSRFToken": csrf,
-            "X-IG-App-ID": "936619743392459",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
         while has_next:
             page_num += 1
-            jobs[job_id]["progress"] = f"Baixando página {page_num} de comentários... ({len(all_comments)} até agora)"
+            jobs[job_id]["progress"] = f"{len(all_comments)} comentários extraídos... (página {page_num})"
 
             variables = {
                 "shortcode": shortcode,
@@ -104,59 +115,68 @@ def get_media_comments_paginated(job_id: str, url: str):
             if end_cursor:
                 variables["after"] = end_cursor
 
-            params = {
-                "query_hash": COMMENTS_QUERY_HASH,
-                "variables": json.dumps(variables, separators=(",", ":")),
-            }
-
             resp = session.get(
                 "https://www.instagram.com/graphql/query/",
-                params=params,
-                headers=graphql_headers,
+                params={
+                    "query_hash": COMMENTS_QUERY_HASH,
+                    "variables": json.dumps(variables, separators=(",", ":")),
+                },
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "*/*",
+                    "Accept-Language": "pt-BR,pt;q=0.9",
+                    "Referer": f"https://www.instagram.com/p/{shortcode}/",
+                    "X-CSRFToken": csrf,
+                    "X-IG-App-ID": "936619743392459",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 timeout=25,
             )
 
-            print(f"[JOB {job_id}] GraphQL pág {page_num} | HTTP {resp.status_code} | Tam: {len(resp.text)}")
-            print(f"[JOB {job_id}] Resposta (primeiros 500 chars): {resp.text[:500]}")
+            print(f"[JOB {job_id}] GraphQL pág {page_num} | HTTP {resp.status_code} | {len(resp.text)} bytes")
 
             if resp.status_code == 429:
-                print(f"[JOB {job_id}] Rate limit! Aguardando 15s...")
-                time.sleep(15)
+                wait = 15
+                print(f"[JOB {job_id}] Rate limit! Aguardando {wait}s...")
+                jobs[job_id]["progress"] = f"Rate limit... aguardando {wait}s ({len(all_comments)} comentários até agora)"
+                time.sleep(wait)
                 continue
 
-            if resp.status_code != 200:
-                raise Exception(f"Instagram retornou HTTP {resp.status_code}. Resposta: {resp.text[:300]}")
+            if resp.status_code == 401:
+                raise Exception(
+                    "Sessão inválida ou expirada (HTTP 401). "
+                    "Renove o INSTAGRAM_SESSION_ID no Render com um novo cookie do seu navegador."
+                )
 
-            # Tentar parsear JSON — se falhar, o HTML retornado vai aparecer no log
+            if resp.status_code != 200:
+                print(f"[JOB {job_id}] Resposta inesperada: {resp.text[:500]}")
+                raise Exception(f"Instagram retornou HTTP {resp.status_code}: {resp.text[:300]}")
+
             try:
                 data = resp.json()
             except Exception:
-                print(f"[JOB {job_id}] Resposta NÃO é JSON! Conteúdo: {resp.text[:800]}")
-                raise Exception(
-                    f"Instagram retornou HTML (não JSON) na página {page_num}. "
-                    "Isso indica bloqueio por IP de servidor. "
-                    "Verifique os logs do Render para ver a resposta completa."
-                )
+                print(f"[JOB {job_id}] Resposta não-JSON: {resp.text[:800]}")
+                raise Exception("Instagram não retornou JSON válido. Verifique o sessionid.")
 
-            # Navegar na estrutura do JSON
-            media = (
+            # Navegar na estrutura do GraphQL
+            edge_media_to_comment = (
                 data.get("data", {})
                     .get("shortcode_media", {})
+                    .get("edge_media_to_comment", {})
             )
-            edge_media_to_comment = media.get("edge_media_to_comment", {})
             edges = edge_media_to_comment.get("edges", [])
 
             for edge in edges:
                 node = edge.get("node", {})
                 username = node.get("owner", {}).get("username", "desconhecido")
                 text = node.get("text", "")
-                all_comments.append({"user": username, "text": text})
+                if text:
+                    all_comments.append({"user": username, "text": text})
 
             page_info = edge_media_to_comment.get("page_info", {})
             has_next = page_info.get("has_next_page", False)
             end_cursor = page_info.get("end_cursor", None)
 
-            jobs[job_id]["progress"] = f"{len(all_comments)} comentários extraídos..."
             print(f"[JOB {job_id}] Total: {len(all_comments)} | has_next: {has_next}")
 
             if has_next and end_cursor:
@@ -166,32 +186,26 @@ def get_media_comments_paginated(job_id: str, url: str):
             else:
                 break
 
-        if not all_comments:
-            # Pode ser que o Instagram retornou dados mas em estrutura diferente
-            # Tentar estrutura alternativa: edge_media_preview_comment
-            print(f"[JOB {job_id}] Nenhum comentário encontrado. Estrutura do JSON: {json.dumps(data, indent=2)[:1000]}")
-
         jobs[job_id]["comments"] = all_comments
-        jobs[job_id]["progress"] = f"Extração de {len(all_comments)} comentários finalizada!"
+        jobs[job_id]["progress"] = f"✅ {len(all_comments)} comentários extraídos com sucesso!"
         jobs[job_id]["status"] = "completed"
         print(f"[JOB {job_id}] CONCLUÍDO. {len(all_comments)} comentários.")
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f"ERRO AO RASPAR COMENTÁRIOS:\n{tb}")
+        print(f"ERRO AO RASPAR COMENTÁRIOS:\n{traceback.format_exc()}")
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = f"{str(e)}"
+        jobs[job_id]["error"] = str(e)
 
 
 @app.post("/api/scrape")
 async def start_scraping(req: ScrapeRequest, background_tasks: BackgroundTasks):
-    print(f"[SCRAPE] Body recebido: url={req.url!r}")
+    print(f"[SCRAPE] url recebida: {req.url!r}")
 
     if not req.url or not req.url.strip():
         return JSONResponse(
             status_code=400,
-            content={"error": "Campo 'url' é obrigatório e não pode ser vazio."}
+            content={"error": "Campo 'url' é obrigatório."}
         )
 
     job_id = str(uuid.uuid4())
@@ -236,4 +250,7 @@ async def stream_progress(job_id: str, request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Sorteio Insta API rodando!"}
+    return {
+        "status": "ok",
+        "session_configured": bool(INSTAGRAM_SESSION_ID),
+    }
